@@ -357,12 +357,12 @@ fn cmd_info(rootdir: &Path, raw: bool) -> Result<()> {
             println!(
                 "{}",
                 t!(
-                    "ctl.version6_config",
+                    "ctl.version7_config",
                     creator = config.creator,
                     version = config.version
                 )
             );
-            println!("  (V7 protobuf format with AEAD key wrap)");
+            println!("{}", t!("ctl.v7_format_info"));
         }
         ConfigType::V3 => {
             // V3 configs are detected but not supported
@@ -420,6 +420,9 @@ fn cmd_info(rootdir: &Path, raw: bool) -> Result<()> {
 
     if config.block_mac_bytes > 0 {
         println!("{}", t!("ctl.block_mac", bytes = config.block_mac_bytes));
+    }
+    if config.block_mode() == encfs::crypto::block::BlockMode::AesGcmSiv {
+        println!("{}", t!("ctl.aes_gcm_siv_mode"));
     }
 
     // Show KDF information
@@ -856,10 +859,7 @@ fn cmd_cat(args: &[String], extpass: Option<String>, ignore_mac: bool) -> Result
         (rootdir, path)
     } else {
         // Two args: rootdir and path (existing behavior)
-        (
-            PathBuf::from(&args[0]),
-            args[1].clone(),
-        )
+        (PathBuf::from(&args[0]), args[1].clone())
     };
 
     let config_path = find_config_file(&rootdir)?;
@@ -869,10 +869,9 @@ fn cmd_cat(args: &[String], extpass: Option<String>, ignore_mac: bool) -> Result
     let password = get_password(&config_path, extpass)?;
     let cipher = config.get_cipher(&password).context("Invalid password")?;
 
-    let (file_path, path_iv) =
-        resolve_file_path(&rootdir, &path, &cipher, config.chained_name_iv)?;
-    let file = std::fs::File::open(&file_path)
-        .context(t!("ctl.error_failed_to_open_encrypted_file"))?;
+    let (file_path, path_iv) = resolve_file_path(&rootdir, &path, &cipher, config.chained_name_iv)?;
+    let file =
+        std::fs::File::open(&file_path).context(t!("ctl.error_failed_to_open_encrypted_file"))?;
 
     // Read header to get file IV
     use std::os::unix::fs::FileExt;
@@ -898,13 +897,14 @@ fn cmd_cat(args: &[String], extpass: Option<String>, ignore_mac: bool) -> Result
 
     // Use FileDecoder to decrypt content
     use encfs::crypto::file::FileDecoder;
-    let decoder = FileDecoder::new(
+    let decoder = FileDecoder::new_with_mode(
         &cipher,
         &file,
         file_iv,
         header_size,
         config.block_size as u64,
         config.block_mac_bytes as u64,
+        config.block_mode(),
         ignore_mac,
     );
 
@@ -978,11 +978,12 @@ fn cmd_ls(rootdir: &Path, path: &str, extpass: Option<String>) -> Result<()> {
 
                     // Calculate logical size for files
                     let size = if metadata.is_file() {
-                        FileDecoder::<std::fs::File>::calculate_logical_size(
+                        FileDecoder::<std::fs::File>::calculate_logical_size_with_mode(
                             metadata.len(),
                             config.header_size(),
                             config.block_size as u64,
                             config.block_mac_bytes as u64,
+                            config.block_mode(),
                         )
                     } else {
                         metadata.len()
@@ -1141,16 +1142,15 @@ fn cmd_new(rootdir: &Path, extpass: Option<String>, stdinpass: bool) -> Result<(
 
     // Create directory if it doesn't exist
     if !rootdir.exists() {
-        std::fs::create_dir_all(rootdir)
-            .context(t!("ctl.error_failed_to_create_directory", path = rootdir.display()))?;
+        std::fs::create_dir_all(rootdir).context(t!(
+            "ctl.error_failed_to_create_directory",
+            path = rootdir.display()
+        ))?;
     }
     if !rootdir.is_dir() {
         return Err(anyhow::anyhow!(
             "{}",
-            t!(
-                "ctl.error_not_a_directory",
-                path = rootdir.display()
-            )
+            t!("ctl.error_not_a_directory", path = rootdir.display())
         ));
     }
 
@@ -1407,22 +1407,24 @@ fn export_directory(
                 };
 
                 // Decrypt content using FileDecoder
-                let decoder = FileDecoder::new(
+                let decoder = FileDecoder::new_with_mode(
                     cipher,
                     &src_file,
                     file_iv,
                     header_size, // header_size
                     config.block_size as u64,
                     config.block_mac_bytes as u64,
+                    config.block_mode(),
                     false,
                 );
 
                 let file_size = metadata.len();
-                let logical_size = FileDecoder::<std::fs::File>::calculate_logical_size(
+                let logical_size = FileDecoder::<std::fs::File>::calculate_logical_size_with_mode(
                     file_size,
                     header_size,
                     config.block_size as u64,
                     config.block_mac_bytes as u64,
+                    config.block_mode(),
                 );
 
                 let mut dest_file = std::fs::File::create(&dest_path)?;
@@ -1666,23 +1668,33 @@ fn format_v7_config_raw(proto: &encfs::config_proto::Config) -> String {
         out.push_str("}\n");
     }
 
-    if let Some(ref c) = proto.cipher {
-        let alg = match BlockCipherAlgorithm::try_from(c.algorithm) {
-            Ok(BlockCipherAlgorithm::Aes) => "AES",
-            Ok(BlockCipherAlgorithm::Blowfish) => "BLOWFISH",
-            _ => "BLOCK_CIPHER_ALGORITHM_UNSPECIFIED",
-        };
-        out.push_str("cipher {\n");
-        out.push_str(&format!("  algorithm: {}\n", alg));
-        out.push_str(&format!("  key_size: {}\n", c.key_size));
-        out.push_str(&format!("  block_size: {}\n", c.block_size));
-        out.push_str(&format!("  block_mac_bytes: {}\n", c.block_mac_bytes));
-        out.push_str(&format!(
-            "  block_mac_rand_bytes: {}\n",
-            c.block_mac_rand_bytes
-        ));
-        out.push_str(&format!("  unique_iv: {}\n", c.unique_iv));
-        out.push_str("}\n");
+    match proto.cipher {
+        Some(encfs::config_proto::config::Cipher::Legacy(ref c)) => {
+            let alg = match BlockCipherAlgorithm::try_from(c.algorithm) {
+                Ok(BlockCipherAlgorithm::Aes) => "AES",
+                Ok(BlockCipherAlgorithm::Blowfish) => "BLOWFISH",
+                _ => "BLOCK_CIPHER_ALGORITHM_UNSPECIFIED",
+            };
+            out.push_str("cipher {\n");
+            out.push_str(&format!("  algorithm: {}\n", alg));
+            out.push_str(&format!("  key_size: {}\n", c.key_size));
+            out.push_str(&format!("  block_size: {}\n", c.block_size));
+            out.push_str(&format!("  block_mac_bytes: {}\n", c.block_mac_bytes));
+            out.push_str(&format!(
+                "  block_mac_rand_bytes: {}\n",
+                c.block_mac_rand_bytes
+            ));
+            out.push_str(&format!("  unique_iv: {}\n", c.unique_iv));
+            out.push_str("}\n");
+        }
+        Some(encfs::config_proto::config::Cipher::GcmSiv(ref c)) => {
+            out.push_str("aes_gcm_siv_cipher {\n");
+            out.push_str(&format!("  key_size: {}\n", c.key_size));
+            out.push_str(&format!("  block_size: {}\n", c.block_size));
+            out.push_str(&format!("  unique_iv: {}\n", c.unique_iv));
+            out.push_str("}\n");
+        }
+        None => {}
     }
 
     if let Some(ref n) = proto.name_encoding {
@@ -1757,16 +1769,21 @@ fn find_rootdir_and_relative_path(file_path: &Path) -> Result<(PathBuf, String)>
         match find_config_file(&current) {
             Ok(_) => {
                 // Found config - current is the rootdir
-                let file_path_canon = file_path
-                    .canonicalize()
-                    .context(t!("ctl.error_failed_to_resolve_path", path = file_path.display()))?;
-                let rootdir_canon = current
-                    .canonicalize()
-                    .context(t!("ctl.error_failed_to_resolve_path", path = current.display()))?;
+                let file_path_canon = file_path.canonicalize().context(t!(
+                    "ctl.error_failed_to_resolve_path",
+                    path = file_path.display()
+                ))?;
+                let rootdir_canon = current.canonicalize().context(t!(
+                    "ctl.error_failed_to_resolve_path",
+                    path = current.display()
+                ))?;
                 let relative = file_path_canon.strip_prefix(&rootdir_canon).map_err(|_| {
                     anyhow::anyhow!(
                         "{}",
-                        t!("ctl.error_file_not_in_encfs_root", path = file_path.display())
+                        t!(
+                            "ctl.error_file_not_in_encfs_root",
+                            path = file_path.display()
+                        )
                     )
                 })?;
                 let path_str = relative
@@ -1782,7 +1799,10 @@ fn find_rootdir_and_relative_path(file_path: &Path) -> Result<(PathBuf, String)>
                     .ok_or_else(|| {
                         anyhow::anyhow!(
                             "{}",
-                            t!("ctl.error_no_config_in_parent_dirs", path = file_path.display())
+                            t!(
+                                "ctl.error_no_config_in_parent_dirs",
+                                path = file_path.display()
+                            )
                         )
                     })?
                     .to_path_buf();

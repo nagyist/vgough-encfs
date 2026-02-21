@@ -12,8 +12,13 @@ message Config {
   // Argon2 KDF parameters and salt (required for V7).
   Argon2Kdf argon2 = 2;
 
-  // Block cipher and block-level options.
-  BasicBlockCipher cipher = 3;
+  oneof cipher {
+    // Legacy block cipher and block-level options (V4-V6 compatible behavior).
+    BasicBlockCipher legacy = 3;
+
+    // AES-GCM-SIV block configuration (V7 authenticated block mode).
+    AesGcmSivBlockCipher gcm_siv = 7;
+  }
 
   // Filename encoding and name IV options.
   NameEncoding name_encoding = 4;
@@ -45,6 +50,12 @@ message BasicBlockCipher {
   int32 block_mac_bytes = 4;
   int32 block_mac_rand_bytes = 5;   // must be 0 for current implementation
   bool unique_iv = 6;
+}
+
+message AesGcmSivBlockCipher {
+  int32 key_size = 1;   // AES key size in bits (128 or 256)
+  int32 block_size = 2;
+  bool unique_iv = 3;
 }
 
 enum NameEncodingMode {

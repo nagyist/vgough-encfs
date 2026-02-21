@@ -1,3 +1,4 @@
+use crate::crypto::block::{BlockLayout, BlockMode};
 use crate::crypto::file::{FileDecoder, FileEncoder};
 use crate::crypto::ssl::SslCipher;
 use base64::Engine;
@@ -44,6 +45,7 @@ pub struct EncFs {
     next_fh: AtomicU64,
     block_size: u64,
     block_mac_bytes: u64,
+    block_mode: BlockMode,
     chained_name_iv: bool,
     external_iv_chaining: bool,
     pub config: crate::config::EncfsConfig,
@@ -58,6 +60,7 @@ impl EncFs {
             next_fh: AtomicU64::new(1),
             block_size: config.block_size as u64,
             block_mac_bytes: config.block_mac_bytes as u64,
+            block_mode: config.block_mode(),
             chained_name_iv: config.chained_name_iv,
             external_iv_chaining: config.external_iv_chaining,
             config,
@@ -603,7 +606,7 @@ impl FilesystemMT for EncFs {
             files: stat.f_files,
             ffree: stat.f_ffree,
             bsize: stat.f_bsize as u32,
-            namelen: stat.f_namemax as u32,
+            namelen: self.cipher.max_plaintext_name_len(stat.f_namemax as u32),
             frsize: stat.f_frsize as u32,
         })
     }
@@ -735,11 +738,14 @@ impl FilesystemMT for EncFs {
         let metadata = file_ref
             .metadata()
             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        let current_logical_size = FileDecoder::<File>::calculate_logical_size(
+        let block_layout = BlockLayout::new(self.block_mode, self.block_size, self.block_mac_bytes)
+            .map_err(|_| libc::EINVAL)?;
+        let current_logical_size = FileDecoder::<File>::calculate_logical_size_with_mode(
             metadata.len(),
             8, // header size
             self.block_size,
             self.block_mac_bytes,
+            self.block_mode,
         );
 
         if size == current_logical_size {
@@ -771,13 +777,14 @@ impl FilesystemMT for EncFs {
             0
         };
 
-        let encoder = FileEncoder::new(
+        let encoder = FileEncoder::new_with_mode(
             &self.cipher,
             file_ref,
             file_iv,
             header_size,
             self.block_size,
             self.block_mac_bytes,
+            self.block_mode,
         );
 
         if size > current_logical_size {
@@ -803,10 +810,7 @@ impl FilesystemMT for EncFs {
         } else {
             // Shrinking
             // We need to fix the last block.
-            if self.block_size <= self.block_mac_bytes {
-                return Err(libc::EINVAL);
-            }
-            let data_block_size = self.block_size - self.block_mac_bytes;
+            let data_block_size = block_layout.data_size_per_block();
             let block_num = size / data_block_size;
             let offset_in_block = size % data_block_size;
 
@@ -814,13 +818,14 @@ impl FilesystemMT for EncFs {
             if offset_in_block > 0 {
                 // Read the plaintext of this block.
                 // We use a decoder for this.
-                let decoder = FileDecoder::new(
+                let decoder = FileDecoder::new_with_mode(
                     &self.cipher,
                     file_ref,
                     file_iv,
                     header_size,
                     self.block_size,
                     self.block_mac_bytes,
+                    self.block_mode,
                     false,
                 );
 
@@ -846,11 +851,12 @@ impl FilesystemMT for EncFs {
                 // Otherwise, `FileEncoder::write_at` will decrypt the existing (larger) partial
                 // block and re-encrypt it at the old length, and the subsequent `set_len()`
                 // would truncate the ciphertext mid-stream, corrupting the last block.
-                let physical_size = FileEncoder::<File>::calculate_physical_size(
+                let physical_size = FileEncoder::<File>::calculate_physical_size_with_mode(
                     size,
                     header_size,
                     self.block_size,
                     self.block_mac_bytes,
+                    self.block_mode,
                 );
                 file_ref
                     .set_len(physical_size)
@@ -866,11 +872,12 @@ impl FilesystemMT for EncFs {
             }
 
             // Now safe to physically truncate
-            let physical_size = FileEncoder::<File>::calculate_physical_size(
+            let physical_size = FileEncoder::<File>::calculate_physical_size_with_mode(
                 size,
                 header_size,
                 self.block_size,
                 self.block_mac_bytes,
+                self.block_mode,
             );
             file_ref
                 .set_len(physical_size)
@@ -991,6 +998,30 @@ impl FilesystemMT for EncFs {
         Ok(plain_target_bytes)
     }
 
+    fn link(
+        &self,
+        req: RequestInfo,
+        path: &Path,
+        newparent: &Path,
+        newname: &OsStr,
+    ) -> ResultEntry {
+        debug!("link: {:?} -> {:?}/{:?}", path, newparent, newname);
+
+        if self.external_iv_chaining {
+            return Err(libc::EPERM);
+        }
+
+        let new_path = newparent.join(newname);
+        let (real_path, _) = self.encrypt_path(path)?;
+        let (real_new_path, _) = self.encrypt_path(&new_path)?;
+
+        if let Err(e) = std::fs::hard_link(&real_path, &real_new_path) {
+            return Err(e.raw_os_error().unwrap_or(libc::EIO));
+        }
+
+        self.getattr(req, &new_path, None)
+    }
+
     fn symlink(
         &self,
         req: RequestInfo,
@@ -1066,20 +1097,24 @@ impl FilesystemMT for EncFs {
         // Adjust size for header and MAC
         let header_size = self.config.header_size();
         if metadata.is_file() {
-            size = FileDecoder::<std::fs::File>::calculate_logical_size(
+            size = FileDecoder::<std::fs::File>::calculate_logical_size_with_mode(
                 metadata.len(),
                 header_size,
                 self.block_size,
                 self.block_mac_bytes,
+                self.block_mode,
             );
         }
 
         let attr = FileAttr {
             size,
             blocks: metadata.blocks(),
-            atime: SystemTime::UNIX_EPOCH + Duration::from_secs(metadata.atime() as u64),
-            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(metadata.mtime() as u64),
-            ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(metadata.ctime() as u64),
+            atime: SystemTime::UNIX_EPOCH
+                + Duration::new(metadata.atime() as u64, metadata.atime_nsec() as u32),
+            mtime: SystemTime::UNIX_EPOCH
+                + Duration::new(metadata.mtime() as u64, metadata.mtime_nsec() as u32),
+            ctime: SystemTime::UNIX_EPOCH
+                + Duration::new(metadata.ctime() as u64, metadata.ctime_nsec() as u32),
             crtime: SystemTime::UNIX_EPOCH,
             kind: metadata_to_file_type(&metadata),
             perm: metadata.mode() as u16,
@@ -1284,13 +1319,14 @@ impl FilesystemMT for EncFs {
             }
         };
 
-        let decoder = FileDecoder::new(
+        let decoder = FileDecoder::new_with_mode(
             &self.cipher,
             &handle.file,
             handle.file_iv,
             handle.header_size,
             self.block_size,
             self.block_mac_bytes,
+            self.block_mode,
             false,
         );
 
@@ -1344,13 +1380,14 @@ impl FilesystemMT for EncFs {
             }
         };
 
-        let encoder = FileEncoder::new(
+        let encoder = FileEncoder::new_with_mode(
             &self.cipher,
             &handle.file,
             handle.file_iv,
             handle.header_size,
             self.block_size,
             self.block_mac_bytes,
+            self.block_mode,
         );
 
         match encoder.write_at(&data, offset) {
@@ -1491,7 +1528,10 @@ impl FilesystemMT for EncFs {
         let mode_bits = mode & libc::S_IFMT;
         let res = if mode_bits == libc::S_IFIFO {
             unsafe { libc::mkfifo(c_path.as_ptr(), mode) }
-        } else if mode_bits == libc::S_IFCHR || mode_bits == libc::S_IFBLK {
+        } else if mode_bits == libc::S_IFCHR
+            || mode_bits == libc::S_IFBLK
+            || mode_bits == libc::S_IFSOCK
+        {
             unsafe { libc::mknod(c_path.as_ptr(), mode, rdev as libc::dev_t) }
         } else if mode_bits == libc::S_IFREG {
             use std::io::Write;
@@ -1510,10 +1550,11 @@ impl FilesystemMT for EncFs {
             {
                 Ok(mut f) => {
                     if header_size > 0 {
-                        let (header, _iv) = self.cipher.encrypt_header(external_iv).map_err(|e| {
-                            error!("Failed to generate header for mknod: {}", e);
-                            libc::EIO
-                        })?;
+                        let (header, _iv) =
+                            self.cipher.encrypt_header(external_iv).map_err(|e| {
+                                error!("Failed to generate header for mknod: {}", e);
+                                libc::EIO
+                            })?;
                         f.write_all(&header)
                             .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
                     }
