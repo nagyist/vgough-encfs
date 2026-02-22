@@ -48,9 +48,11 @@ pub struct FileDecoder<'a, F: ReadAt> {
     block_mac_bytes: u64,
     block_mode: BlockMode,
     ignore_mac_mismatch: bool,
+    allow_holes: bool,
 }
 
 impl<'a, F: ReadAt> FileDecoder<'a, F> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cipher: &'a SslCipher,
         file: &'a F,
@@ -59,6 +61,7 @@ impl<'a, F: ReadAt> FileDecoder<'a, F> {
         block_size: u64,
         block_mac_bytes: u64,
         ignore_mac_mismatch: bool,
+        allow_holes: bool,
     ) -> Self {
         Self::new_with_mode(
             cipher,
@@ -69,6 +72,7 @@ impl<'a, F: ReadAt> FileDecoder<'a, F> {
             block_mac_bytes,
             BlockMode::Legacy,
             ignore_mac_mismatch,
+            allow_holes,
         )
     }
 
@@ -82,6 +86,7 @@ impl<'a, F: ReadAt> FileDecoder<'a, F> {
         block_mac_bytes: u64,
         block_mode: BlockMode,
         ignore_mac_mismatch: bool,
+        allow_holes: bool,
     ) -> Self {
         Self {
             cipher,
@@ -92,6 +97,7 @@ impl<'a, F: ReadAt> FileDecoder<'a, F> {
             block_mac_bytes,
             block_mode,
             ignore_mac_mismatch,
+            allow_holes,
         }
     }
 
@@ -139,7 +145,12 @@ impl<'a, F: ReadAt> FileDecoder<'a, F> {
     /// 5. Copying the requested slice of decrypted data to the buffer
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         let layout = BlockLayout::new(self.block_mode, self.block_size, self.block_mac_bytes)?;
-        let codec = BlockCodec::new(self.cipher, layout, self.ignore_mac_mismatch);
+        let codec = BlockCodec::new(
+            self.cipher,
+            layout,
+            self.ignore_mac_mismatch,
+            self.allow_holes,
+        );
         let size = buf.len() as u64;
         let mut bytes_remaining = size;
         let mut total_read = 0;
@@ -210,9 +221,11 @@ pub struct FileEncoder<'a, F: ReadAt + WriteAt + FileLen> {
     block_size: u64,
     block_mac_bytes: u64,
     block_mode: BlockMode,
+    allow_holes: bool,
 }
 
 impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cipher: &'a SslCipher,
         file: &'a F,
@@ -220,6 +233,7 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
         header_size: u64,
         block_size: u64,
         block_mac_bytes: u64,
+        allow_holes: bool,
     ) -> Self {
         Self::new_with_mode(
             cipher,
@@ -229,9 +243,11 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
             block_size,
             block_mac_bytes,
             BlockMode::Legacy,
+            allow_holes,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_mode(
         cipher: &'a SslCipher,
         file: &'a F,
@@ -240,6 +256,7 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
         block_size: u64,
         block_mac_bytes: u64,
         block_mode: BlockMode,
+        allow_holes: bool,
     ) -> Self {
         Self {
             cipher,
@@ -249,6 +266,7 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
             block_size,
             block_mac_bytes,
             block_mode,
+            allow_holes,
         }
     }
 
@@ -287,9 +305,6 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
         let physical_block_size_usize = usize::try_from(physical_block_size)
             .map_err(|_| io::Error::other("block_size too large"))?;
 
-        // Detect and fill gaps to prevent sparse files.
-        // Sparse files cause MAC verification failures because reading a block
-        // that partially spans a hole returns zeros that weren't properly encrypted.
         let physical_size = self.file.file_len()?;
         let current_logical_size = FileDecoder::<F>::calculate_logical_size_with_mode(
             physical_size,
@@ -300,40 +315,52 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
         );
 
         if offset > current_logical_size {
-            // Fill the gap with encrypted zeros
-            const CHUNK_SIZE: u64 = crate::constants::FILE_BUFFER_SIZE as u64;
-            let gap_size = offset - current_logical_size;
-            let mut remaining_gap = gap_size;
-            let zeros = vec![0u8; std::cmp::min(remaining_gap, CHUNK_SIZE) as usize];
+            let zeros = vec![0u8; data_block_size as usize];
             let mut gap_offset = current_logical_size;
-
-            while remaining_gap > 0 {
-                let write_len = std::cmp::min(remaining_gap, CHUNK_SIZE);
-                // Recursively call write_at to fill the gap with properly encrypted zeros
+            while gap_offset < offset {
+                let block_offset = gap_offset % data_block_size;
+                let bytes_in_block =
+                    std::cmp::min(offset - gap_offset, data_block_size - block_offset);
                 self.write_at_internal(
-                    &zeros[..write_len as usize],
+                    &zeros[..bytes_in_block as usize],
                     gap_offset,
                     layout,
                     data_block_size,
                     physical_block_size,
                     physical_block_size_usize,
                 )?;
-                remaining_gap -= write_len;
-                gap_offset += write_len;
+                gap_offset += bytes_in_block;
             }
         }
 
-        // Now write the actual data
-        self.write_at_internal(
-            buf,
-            offset,
-            layout,
-            data_block_size,
-            physical_block_size,
-            physical_block_size_usize,
-        )
+        let mut total_written = 0;
+        let mut current_offset = offset;
+        let mut bytes_remaining = buf.len() as u64;
+
+        while bytes_remaining > 0 {
+            let block_offset = current_offset % data_block_size;
+            let bytes_in_block =
+                std::cmp::min(bytes_remaining, data_block_size - block_offset);
+
+            self.write_at_internal(
+                &buf[total_written..total_written + bytes_in_block as usize],
+                current_offset,
+                layout,
+                data_block_size,
+                physical_block_size,
+                physical_block_size_usize,
+            )?;
+
+            total_written += bytes_in_block as usize;
+            current_offset += bytes_in_block;
+            bytes_remaining -= bytes_in_block;
+        }
+
+        Ok(total_written)
     }
 
+    /// Writes a single block's worth of data at the given logical offset.
+    /// The caller must ensure `buf` fits within one block boundary.
     fn write_at_internal(
         &self,
         buf: &[u8],
@@ -343,80 +370,57 @@ impl<'a, F: ReadAt + WriteAt + FileLen> FileEncoder<'a, F> {
         physical_block_size: u64,
         physical_block_size_usize: usize,
     ) -> io::Result<usize> {
-        let codec = BlockCodec::new(self.cipher, layout, false);
-        let size = buf.len() as u64;
-        let mut bytes_remaining = size;
-        let mut total_written = 0;
-        let mut current_offset = offset;
+        let codec = BlockCodec::new(self.cipher, layout, false, self.allow_holes);
 
-        let mut on_disk_block = Vec::with_capacity(physical_block_size_usize);
+        let block_num = offset / data_block_size;
+        let block_offset = offset % data_block_size;
+        let bytes_to_write = buf.len() as u64;
 
-        while bytes_remaining > 0 {
-            let block_num = current_offset / data_block_size;
-            let block_offset = current_offset % data_block_size;
-            let bytes_to_write_in_block =
-                std::cmp::min(bytes_remaining, data_block_size - block_offset);
+        let disk_offset = self.header_size + block_num * physical_block_size;
+        let mut plaintext_block = Vec::new();
 
-            let read_offset = self.header_size + block_num * physical_block_size;
-            let mut plaintext_block = Vec::new();
-
-            // RMW: Enable read if we are not overwriting the entire data portion of the block
-            let is_full_write = block_offset == 0 && bytes_to_write_in_block == data_block_size;
-            if !is_full_write {
-                on_disk_block.resize(physical_block_size_usize, 0);
-                match self.file.read_at(&mut on_disk_block, read_offset) {
-                    Ok(n) => {
-                        if n > 0 {
-                            let existing_payload_len =
-                                n.saturating_sub(layout.overhead_bytes() as usize);
-                            if block_offset == 0
-                                && (bytes_to_write_in_block as usize) >= existing_payload_len
-                            {
-                                // Entire currently stored payload will be overwritten; no need to
-                                // decrypt potentially truncated/corrupt bytes for read-modify-write.
-                                plaintext_block.clear();
-                            } else {
-                                on_disk_block.truncate(n);
-                                plaintext_block = codec
-                                    .decrypt_block(block_num, self.file_iv, &mut on_disk_block)
-                                    .map_err(|e| {
-                                        io::Error::other(format!(
-                                            "Decrypt failed during RMW: {}",
-                                            e
-                                        ))
-                                    })?;
-                            }
+        let is_full_write = block_offset == 0 && bytes_to_write == data_block_size;
+        if !is_full_write {
+            let mut on_disk_block = vec![0u8; physical_block_size_usize];
+            match self.file.read_at(&mut on_disk_block, disk_offset) {
+                Ok(n) => {
+                    if n > 0 {
+                        let existing_payload_len =
+                            n.saturating_sub(layout.overhead_bytes() as usize);
+                        if block_offset == 0
+                            && (bytes_to_write as usize) >= existing_payload_len
+                        {
+                            plaintext_block.clear();
+                        } else {
+                            on_disk_block.truncate(n);
+                            plaintext_block = codec
+                                .decrypt_block(block_num, self.file_iv, &mut on_disk_block)
+                                .map_err(|e| {
+                                    io::Error::other(format!(
+                                        "Decrypt failed during RMW: {}",
+                                        e
+                                    ))
+                                })?;
                         }
                     }
-                    Err(e) => return Err(e),
                 }
+                Err(e) => return Err(e),
             }
-
-            // Extend buffer if necessary to cover the new write range
-            let required_len = (block_offset + bytes_to_write_in_block) as usize;
-            if plaintext_block.len() < required_len {
-                plaintext_block.resize(required_len, 0);
-            }
-
-            // Copy new data
-            let src_start = total_written;
-            let src_end = src_start + bytes_to_write_in_block as usize;
-            let dst_start = block_offset as usize;
-            let dst_end = dst_start + bytes_to_write_in_block as usize;
-
-            plaintext_block[dst_start..dst_end].copy_from_slice(&buf[src_start..src_end]);
-            let encrypted_block = codec.encrypt_block(block_num, self.file_iv, &plaintext_block)?;
-
-            // Write
-            self.file.write_at(&encrypted_block, read_offset)?;
-
-            let written = bytes_to_write_in_block;
-            total_written += written as usize;
-            current_offset += written;
-            bytes_remaining -= written;
         }
 
-        Ok(total_written)
+        let required_len = (block_offset + bytes_to_write) as usize;
+        if plaintext_block.len() < required_len {
+            plaintext_block.resize(required_len, 0);
+        }
+
+        let dst_start = block_offset as usize;
+        let dst_end = dst_start + buf.len();
+        plaintext_block[dst_start..dst_end].copy_from_slice(buf);
+
+        let encrypted_block = codec.encrypt_block(block_num, self.file_iv, &plaintext_block)?;
+        self.file.write_at(&encrypted_block, disk_offset)?;
+
+        Ok(buf.len())
     }
 }
 
@@ -687,6 +691,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
         );
 
         let data = b"Hello, World! This is a test of the EncFS file encryption system.";
@@ -706,6 +711,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
             false,
         );
 
@@ -737,6 +743,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
         );
 
         // Data: "A" * 100.
@@ -759,6 +766,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
             false,
         );
 
@@ -788,6 +796,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
         );
         let data = b"Sensitive Data";
         encoder.write_at(data, 0).expect("Write failed");
@@ -807,6 +816,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
             false,
         );
         let mut buf = vec![0u8; data.len()];
@@ -835,6 +845,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             BlockMode::AesGcmSiv,
+            false,
         );
 
         let data = vec![b'Z'; 100];
@@ -859,6 +870,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             BlockMode::AesGcmSiv,
+            false,
             false,
         );
 
@@ -889,6 +901,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             BlockMode::AesGcmSiv,
+            false,
         );
         let data = b"Authenticated block payload";
         encoder.write_at(data, 0).expect("Write failed");
@@ -907,6 +920,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             BlockMode::AesGcmSiv,
+            false,
             false,
         );
         let mut buf = vec![0u8; data.len()];
@@ -936,6 +950,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
         );
 
         // Write initial data: "AAAA..." (56 bytes - full block)
@@ -954,6 +969,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
             false,
         );
         let mut buf = vec![0u8; 56];
@@ -986,6 +1002,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             BlockMode::AesGcmSiv,
+            false,
         );
 
         // Write initial data: "ABCD..." (48 bytes - exactly one full AES-GCM-SIV plaintext block, 64 - 16)
@@ -1005,6 +1022,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             BlockMode::AesGcmSiv,
+            false,
             false,
         );
         let mut buf = vec![0u8; 48];
@@ -1036,6 +1054,7 @@ mod tests {
             header_size,
             block_size,
             block_mac_bytes,
+            false,
         );
 
         // Initial write at offset 0
@@ -1060,6 +1079,7 @@ mod tests {
             block_size,
             block_mac_bytes,
             false,
+            false,
         );
 
         // Read back the "End"
@@ -1080,5 +1100,259 @@ mod tests {
             .read_at(&mut zero_buf, large_offset - 100)
             .expect("Read gap end");
         assert_eq!(zero_buf, vec![0u8; 100]);
+    }
+
+    #[test]
+    fn test_allow_holes_zero_block_passthrough_no_mac() {
+        let mut cipher = create_cipher();
+        let key = vec![0u8; 16];
+        let iv = vec![0u8; 32];
+        cipher.set_key(&key, &iv);
+
+        let file_iv = 987654;
+        let header_size = 8;
+        let block_size = 64;
+        let block_mac_bytes = 0; // No MACs (standard mode)
+
+        // Create a file with a sparse hole (all zeros in a block)
+        let mock_file = MockFile::new(vec![0u8; header_size as usize + block_size as usize]);
+
+        // Decoder WITHOUT allow_holes - should try to decrypt zeros as ciphertext
+        let decoder_no_holes = FileDecoder::new(
+            &cipher,
+            &mock_file,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false,
+            false, // allow_holes = false
+        );
+
+        let mut buf_no_holes = vec![0u8; block_size as usize];
+        let read = decoder_no_holes
+            .read_at(&mut buf_no_holes, 0)
+            .expect("Read should succeed");
+        assert_eq!(read, block_size as usize);
+        // Without allow_holes, decrypting zeros produces non-zero garbage
+        assert_ne!(buf_no_holes, vec![0u8; block_size as usize]);
+
+        // Decoder WITH allow_holes - should return zeros as plaintext
+        let decoder_with_holes = FileDecoder::new(
+            &cipher,
+            &mock_file,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false,
+            true, // allow_holes = true
+        );
+
+        let mut buf_with_holes = vec![0u8; block_size as usize];
+        let read = decoder_with_holes
+            .read_at(&mut buf_with_holes, 0)
+            .expect("Read should succeed");
+        assert_eq!(read, block_size as usize);
+        // With allow_holes, reading zeros returns zeros
+        assert_eq!(buf_with_holes, vec![0u8; block_size as usize]);
+    }
+
+    #[test]
+    fn test_allow_holes_sparse_file_extension() {
+        let mut cipher = create_cipher();
+        let key = vec![0u8; 16];
+        let iv = vec![0u8; 32];
+        cipher.set_key(&key, &iv);
+
+        let file_iv = 555555;
+        let header_size = 8;
+        let block_size = 64;
+        let block_mac_bytes = 0;
+
+        // Test WITH allow_holes - should allow sparse gaps
+        let mock_file_sparse = MockFile::new(vec![0u8; header_size as usize]);
+        let encoder_sparse = FileEncoder::new(
+            &cipher,
+            &mock_file_sparse,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            true, // allow_holes = true
+        );
+
+        // Write initial data
+        encoder_sparse.write_at(b"START", 0).expect("Write failed");
+
+        // Write at offset with a gap (should NOT fill gap with encrypted zeros)
+        let offset_with_gap = 200;
+        encoder_sparse
+            .write_at(b"END", offset_with_gap)
+            .expect("Write at gap");
+
+        // Verify both can read back correctly
+        let decoder_sparse = FileDecoder::new(
+            &cipher,
+            &mock_file_sparse,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false,
+            true,
+        );
+
+        let mut buf = vec![0u8; 3];
+        decoder_sparse
+            .read_at(&mut buf, offset_with_gap)
+            .expect("Read");
+        assert_eq!(&buf, b"END");
+
+        // Verify gap reads as zeros
+        let mut gap_buf = vec![0u8; 10];
+        decoder_sparse.read_at(&mut gap_buf, 100).expect("Read gap");
+        assert_eq!(gap_buf, vec![0u8; 10]);
+
+        // Test WITHOUT allow_holes - should fill gap
+        let mock_file_dense = MockFile::new(vec![0u8; header_size as usize]);
+        let encoder_dense = FileEncoder::new(
+            &cipher,
+            &mock_file_dense,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false, // allow_holes = false
+        );
+
+        encoder_dense.write_at(b"START", 0).expect("Write failed");
+        encoder_dense
+            .write_at(b"END", offset_with_gap)
+            .expect("Write at gap");
+
+        let decoder_dense = FileDecoder::new(
+            &cipher,
+            &mock_file_dense,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false,
+            false,
+        );
+
+        let mut buf2 = vec![0u8; 3];
+        decoder_dense
+            .read_at(&mut buf2, offset_with_gap)
+            .expect("Read");
+        assert_eq!(&buf2, b"END");
+
+        // Verify gap was filled with encrypted zeros (reads back as zeros but different on disk)
+        let mut gap_buf2 = vec![0u8; 10];
+        decoder_dense.read_at(&mut gap_buf2, 100).expect("Read gap");
+        assert_eq!(gap_buf2, vec![0u8; 10]);
+    }
+
+    #[test]
+    fn test_allow_holes_zero_block_passthrough_with_mac() {
+        let mut cipher = create_cipher();
+        let key = vec![0u8; 16];
+        let iv = vec![0u8; 32];
+        cipher.set_key(&key, &iv);
+
+        let file_iv = 987654;
+        let header_size: u64 = 8;
+        let block_size: u64 = 64;
+        let block_mac_bytes: u64 = 8;
+        let data_block_size = (block_size - block_mac_bytes) as usize; // 56
+
+        // One full physical block of zeros after the header.
+        let mock_file = MockFile::new(vec![0u8; header_size as usize + block_size as usize]);
+
+        let decoder = FileDecoder::new(
+            &cipher,
+            &mock_file,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false,
+            true, // allow_holes = true
+        );
+
+        let mut buf = vec![0xFFu8; data_block_size];
+        let read = decoder.read_at(&mut buf, 0).expect("Read should succeed");
+        assert_eq!(read, data_block_size);
+        assert_eq!(buf, vec![0u8; data_block_size]);
+    }
+
+    #[test]
+    fn test_allow_holes_sparse_file_extension_with_mac() {
+        let mut cipher = create_cipher();
+        let key = vec![0u8; 16];
+        let iv = vec![0u8; 32];
+        cipher.set_key(&key, &iv);
+
+        let file_iv = 555555;
+        let header_size: u64 = 8;
+        let block_size: u64 = 64;
+        let block_mac_bytes: u64 = 8;
+        let data_block_size = block_size - block_mac_bytes; // 56
+
+        let mock_file = MockFile::new(vec![0u8; header_size as usize]);
+        let encoder = FileEncoder::new(
+            &cipher,
+            &mock_file,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            true, // allow_holes = true
+        );
+
+        // Write a full data block so block 0 occupies exactly block_size bytes
+        // on disk, avoiding a partial block bleeding into the gap region.
+        let payload1 = vec![0xAB; data_block_size as usize];
+        encoder.write_at(&payload1, 0).expect("Write 1 failed");
+
+        // Write past a multi-block gap.  Blocks 1 and 2 are untouched (sparse
+        // holes of zeros).  Block 3 gets the second payload.
+        let offset2 = data_block_size * 3; // 168
+        let payload2 = b"WORLD";
+        encoder.write_at(payload2, offset2).expect("Write 2 failed");
+
+        let decoder = FileDecoder::new(
+            &cipher,
+            &mock_file,
+            file_iv,
+            header_size,
+            block_size,
+            block_mac_bytes,
+            false,
+            true, // allow_holes = true
+        );
+
+        // Verify first payload
+        let mut buf1 = vec![0u8; payload1.len()];
+        decoder.read_at(&mut buf1, 0).expect("Read payload1");
+        assert_eq!(buf1, payload1);
+
+        // Verify hole blocks are zeros
+        let hole_len = (offset2 - data_block_size) as usize; // blocks 1-2
+        let mut hole_buf = vec![0xFFu8; hole_len];
+        let n = decoder
+            .read_at(&mut hole_buf, data_block_size)
+            .expect("Read hole");
+        assert_eq!(n, hole_len);
+        assert!(
+            hole_buf.iter().all(|&b| b == 0),
+            "Hole region should be all zeros"
+        );
+
+        // Verify second payload
+        let mut buf2 = vec![0u8; payload2.len()];
+        decoder.read_at(&mut buf2, offset2).expect("Read payload2");
+        assert_eq!(&buf2, payload2);
     }
 }
