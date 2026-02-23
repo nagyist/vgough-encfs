@@ -162,6 +162,10 @@ fn help_new_stdinpass() -> String {
     t!("help.encfsctl.new_stdinpass").to_string()
 }
 
+fn help_new_no_chained_iv() -> String {
+    t!("help.encfsctl.new_no_chained_iv").to_string()
+}
+
 #[derive(Parser)]
 #[command(name = "encfsctl")]
 #[command(about = help_about())]
@@ -253,6 +257,8 @@ enum Command {
         extpass: Option<String>,
         #[arg(short = 'S', long = "stdinpass", help = help_new_stdinpass())]
         stdinpass: bool,
+        #[arg(long, help = help_new_no_chained_iv())]
+        no_chained_iv: bool,
     },
 }
 
@@ -296,7 +302,8 @@ fn main() -> Result<()> {
             rootdir,
             extpass,
             stdinpass,
-        }) => cmd_new(&rootdir, extpass, stdinpass),
+            no_chained_iv,
+        }) => cmd_new(&rootdir, extpass, stdinpass, no_chained_iv),
         None => {
             // Default to info command if rootdir is provided
             if let Some(rootdir) = cli.rootdir {
@@ -405,28 +412,53 @@ fn cmd_info(rootdir: &Path, raw: bool) -> Result<()> {
             minor = config.name_iface.minor
         )
     );
-    if config.unique_iv {
-        println!("{}", t!("ctl.unique_iv_header"));
-    }
-
-    if config.chained_name_iv {
-        println!("{}", t!("ctl.chained_name_iv"));
-    }
-
-    if config.external_iv_chaining {
-        println!("{}", t!("ctl.external_iv_chaining"));
-    }
-
-    if config.block_mode() == encfs::crypto::block::BlockMode::AesGcmSiv {
-        println!("{}", t!("ctl.aes_gcm_siv_mode"));
-    }
+    println!(
+        "{}{}",
+        t!("ctl.unique_iv_header"),
+        t!(if config.unique_iv {
+            "ctl.bool_true"
+        } else {
+            "ctl.bool_false"
+        })
+    );
+    println!(
+        "{}{}",
+        t!("ctl.chained_name_iv"),
+        t!(if config.chained_name_iv {
+            "ctl.bool_true"
+        } else {
+            "ctl.bool_false"
+        })
+    );
+    println!(
+        "{}{}",
+        t!("ctl.external_iv_chaining"),
+        t!(if config.external_iv_chaining {
+            "ctl.bool_true"
+        } else {
+            "ctl.bool_false"
+        })
+    );
+    let block_mode_str = match (config.block_mode(), config.cipher_iface.name.as_str()) {
+        (encfs::crypto::block::BlockMode::AesGcmSiv, _) => t!("ctl.block_mode_aes_gcm_siv"),
+        (encfs::crypto::block::BlockMode::Legacy, "ssl/aes") => t!("ctl.block_mode_legacy_aes"),
+        (encfs::crypto::block::BlockMode::Legacy, "ssl/blowfish") => {
+            t!("ctl.block_mode_legacy_blowfish")
+        }
+        _ => t!("ctl.block_mode_legacy"),
+    };
+    println!("{}{}", t!("ctl.block_mode"), block_mode_str);
     println!("{}", t!("ctl.block_size", size = config.block_size));
-    if config.block_mac_bytes > 0 {
-        println!("{}", t!("ctl.block_mac", bytes = config.block_mac_bytes));
-    }
-    if config.allow_holes {
-        println!("{}", t!("ctl.allow_holes"));
-    }
+    println!("{}", t!("ctl.block_mac", bytes = config.block_mac_bytes));
+    println!(
+        "{}{}",
+        t!("ctl.allow_holes"),
+        t!(if config.allow_holes {
+            "ctl.bool_true"
+        } else {
+            "ctl.bool_false"
+        })
+    );
 
     // Show KDF information
     use config::KdfAlgorithm;
@@ -872,7 +904,7 @@ fn cmd_cat(args: &[String], extpass: Option<String>, ignore_mac: bool) -> Result
     let password = get_password(&config_path, extpass)?;
     let cipher = config.get_cipher(&password).context("Invalid password")?;
 
-    let (file_path, path_iv) = resolve_file_path(&rootdir, &path, &cipher, config.chained_name_iv)?;
+    let (file_path, path_iv) = resolve_file_path(&rootdir, &path, &cipher, &config)?;
     let file =
         std::fs::File::open(&file_path).context(t!("ctl.error_failed_to_open_encrypted_file"))?;
 
@@ -900,16 +932,12 @@ fn cmd_cat(args: &[String], extpass: Option<String>, ignore_mac: bool) -> Result
 
     // Use FileDecoder to decrypt content
     use encfs::crypto::file::FileDecoder;
-    let decoder = FileDecoder::new_with_mode(
+    let decoder = FileDecoder::new_from_config(
         &cipher,
         &file,
         file_iv,
-        header_size,
-        config.block_size as u64,
-        config.block_mac_bytes as u64,
-        config.block_mode(),
+        &config.file_codec_params(),
         ignore_mac,
-        config.allow_holes,
     );
 
     // Stream to stdout to avoid allocating the full file in memory.
@@ -943,7 +971,7 @@ fn cmd_ls(rootdir: &Path, path: &str, extpass: Option<String>) -> Result<()> {
     // Encrypt the path to get the real directory path
     let plaintext_path = PathBuf::from(path);
     let (encrypted_dir_path, dir_iv) =
-        encrypt_path_with_iv(rootdir, &plaintext_path, &cipher, config.chained_name_iv)?;
+        encrypt_path_with_iv(rootdir, &plaintext_path, &cipher, &config)?;
 
     let entries =
         std::fs::read_dir(&encrypted_dir_path).context(t!("ctl.error_failed_to_read_directory"))?;
@@ -1141,7 +1169,12 @@ fn cmd_autopasswd(rootdir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_new(rootdir: &Path, extpass: Option<String>, stdinpass: bool) -> Result<()> {
+fn cmd_new(
+    rootdir: &Path,
+    extpass: Option<String>,
+    stdinpass: bool,
+    no_chained_iv: bool,
+) -> Result<()> {
     use openssl::rand::rand_bytes;
 
     // Create directory if it doesn't exist
@@ -1174,6 +1207,10 @@ fn cmd_new(rootdir: &Path, extpass: Option<String>, stdinpass: bool) -> Result<(
     }
 
     let mut config = config::EncfsConfig::standard_v7();
+    if no_chained_iv {
+        config.chained_name_iv = false;
+        config.external_iv_chaining = false;
+    }
     rand_bytes(&mut config.salt).context(t!("ctl.error_failed_to_generate_salt"))?;
 
     let key_len = (config.key_size / 8) as usize;
@@ -1411,16 +1448,12 @@ fn export_directory(
                 };
 
                 // Decrypt content using FileDecoder
-                let decoder = FileDecoder::new_with_mode(
+                let decoder = FileDecoder::new_from_config(
                     cipher,
                     &src_file,
                     file_iv,
-                    header_size, // header_size
-                    config.block_size as u64,
-                    config.block_mac_bytes as u64,
-                    config.block_mode(),
+                    &config.file_codec_params(),
                     false,
-                    config.allow_holes,
                 );
 
                 let file_size = metadata.len();
@@ -1545,7 +1578,7 @@ fn encrypt_path_with_iv(
     rootdir: &Path,
     plaintext_path: &Path,
     cipher: &SslCipher,
-    chained_iv: bool,
+    config: &config::EncfsConfig,
 ) -> Result<(PathBuf, u64)> {
     let mut encrypted_path = PathBuf::new();
     let mut iv = 0u64;
@@ -1558,7 +1591,7 @@ fn encrypt_path_with_iv(
                 let name_bytes = name.as_bytes();
                 let (encrypted_name, new_iv) = cipher.encrypt_filename(name_bytes, iv)?;
                 encrypted_path.push(encrypted_name);
-                if chained_iv {
+                if config.chained_name_iv {
                     iv = new_iv;
                 }
             }
@@ -1938,12 +1971,11 @@ fn resolve_file_path(
     rootdir: &Path,
     path: &str,
     cipher: &SslCipher,
-    chained_iv: bool,
+    config: &config::EncfsConfig,
 ) -> Result<(PathBuf, u64)> {
     // Try as plaintext path first
     let plaintext_path = PathBuf::from(path);
-    let (encrypted_path, path_iv) =
-        encrypt_path_with_iv(rootdir, &plaintext_path, cipher, chained_iv)?;
+    let (encrypted_path, path_iv) = encrypt_path_with_iv(rootdir, &plaintext_path, cipher, config)?;
 
     if encrypted_path.exists() {
         return Ok((encrypted_path, path_iv));
@@ -1954,7 +1986,7 @@ fn resolve_file_path(
     if encrypted_path.exists() {
         // Decrypt the path to get the IV
         let rel_path = PathBuf::from(path);
-        let (_, path_iv) = decrypt_path_with_iv(&rel_path, cipher, chained_iv)?;
+        let (_, path_iv) = decrypt_path_with_iv(&rel_path, cipher, config)?;
         return Ok((encrypted_path, path_iv));
     }
 
@@ -1967,7 +1999,7 @@ fn resolve_file_path(
 fn decrypt_path_with_iv(
     encrypted_path: &Path,
     cipher: &SslCipher,
-    chained_iv: bool,
+    config: &config::EncfsConfig,
 ) -> Result<(PathBuf, u64)> {
     let mut decrypted_path = PathBuf::new();
     let mut iv = 0u64;
@@ -1982,7 +2014,7 @@ fn decrypt_path_with_iv(
                     .ok_or_else(|| anyhow::anyhow!("{}", t!("ctl.error_invalid_utf8")))?;
                 let (decrypted_name_bytes, new_iv) = cipher.decrypt_filename(name_str, iv)?;
                 decrypted_path.push(std::ffi::OsStr::from_bytes(&decrypted_name_bytes));
-                if chained_iv {
+                if config.chained_name_iv {
                     iv = new_iv;
                 }
             }
