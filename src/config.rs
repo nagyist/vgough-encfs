@@ -925,6 +925,10 @@ impl EncfsConfig {
         // Append a newline at the end
         writer.write_all(b"\n")?;
 
+        // Ensure the file is safely on disk
+        let file = writer.into_inner().context("flush failed")?;
+        file.sync_all().context("fsync failed")?;
+
         Ok(())
     }
 
@@ -989,6 +993,11 @@ impl EncfsConfig {
         writer
             .write_all(&buf)
             .context("Failed to write V7 config")?;
+
+        // Ensure the file is safely on disk
+        let file = writer.into_inner().context("flush failed")?;
+        file.sync_all().context("fsync failed")?;
+
         Ok(())
     }
 
