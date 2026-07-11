@@ -1,0 +1,8 @@
+# The `aes` and `polyval` crates (used for AES and AES-GCM-SIV) ship an
+# ARMv8 Crypto Extension backend, but unlike x86_64 AES-NI it is not used by
+# default at runtime detection alone -- it must be compiled in via these cfg
+# flags. Without them, aarch64 builds (Apple Silicon, ARM64 Linux) silently
+# fall back to a portable software implementation that is roughly 8x slower.
+# See https://docs.rs/aes and https://docs.rs/polyval for details.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
