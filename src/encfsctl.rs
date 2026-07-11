@@ -171,6 +171,10 @@ fn help_new_no_unique_iv() -> String {
     t!("help.encfsctl.new_no_unique_iv").to_string()
 }
 
+fn help_speed() -> String {
+    t!("help.encfsctl.speed").to_string()
+}
+
 #[derive(Parser)]
 #[command(name = "encfsctl")]
 #[command(about = help_about(), arg_required_else_help=true)]
@@ -267,6 +271,8 @@ enum Command {
         #[arg(long, help = help_new_no_unique_iv())]
         no_unique_iv: bool,
     },
+    #[command(about = help_speed())]
+    Speed,
 }
 
 fn main() -> Result<()> {
@@ -312,6 +318,7 @@ fn main() -> Result<()> {
             no_chained_iv,
             no_unique_iv,
         }) => cmd_new(&rootdir, extpass, stdinpass, no_chained_iv, no_unique_iv),
+        Some(Command::Speed) => cmd_speed(),
         None => {
             // Default to info command if rootdir is provided
             if let Some(rootdir) = cli.rootdir {
@@ -1411,6 +1418,189 @@ fn cmd_new(
     config.save(&v7_path)?;
 
     println!("{}", t!("ctl.new_config_created", path = v7_path.display()));
+
+    Ok(())
+}
+
+/// Returns the CPU brand string (e.g. "Apple M2" or "Intel(R) Core(TM)
+/// i7-9750H CPU @ 2.60GHz") via sysinfo, or "unknown" if it can't be read.
+fn cpu_brand() -> String {
+    use sysinfo::{CpuRefreshKind, RefreshKind, System};
+
+    let sys =
+        System::new_with_specifics(RefreshKind::nothing().with_cpu(CpuRefreshKind::everything()));
+    sys.cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim().to_string())
+        .filter(|brand| !brand.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Whether the CPU exposes hardware-accelerated AES (AES-NI on x86_64, the
+/// ARMv8 Crypto Extension on aarch64). Determines whether the throughput
+/// numbers below reflect an accelerated or a pure-software path.
+fn aes_hw_accel() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("aes")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// Repeatedly runs `op` over a fixed-size buffer for at least `duration`,
+/// returning the achieved throughput in MB/s (1 MB = 1024 * 1024 bytes).
+fn measure_throughput(
+    buf: &mut [u8],
+    duration: std::time::Duration,
+    mut op: impl FnMut(&mut [u8], u64) -> Result<()>,
+) -> Result<f64> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let mut total_bytes: u64 = 0;
+    let mut block_num: u64 = 0;
+    while start.elapsed() < duration {
+        op(buf, block_num)?;
+        block_num = block_num.wrapping_add(1);
+        total_bytes += buf.len() as u64;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    Ok((total_bytes as f64 / elapsed) / (1024.0 * 1024.0))
+}
+
+/// Benchmarks the V7 AES-GCM-SIV block cipher at the given key size (128 or 256).
+fn bench_aes_gcm_siv(key_size: i32, buf_size: usize, duration: std::time::Duration) -> Result<f64> {
+    use encfs::config::Interface;
+    use encfs::crypto::cipher;
+
+    let iface = Interface {
+        name: "ssl/aes".to_string(),
+        major: 4,
+        minor: 0,
+        age: 0,
+    };
+    let mut cipher = cipher::build(&iface, key_size)?;
+    let mut key = vec![0u8; (key_size / 8) as usize];
+    fill_random(&mut key).map_err(|e| anyhow::anyhow!("Failed to generate key: {}", e))?;
+    let iv = vec![0u8; cipher.iv_len()];
+    cipher.set_key(&key, &iv);
+
+    let mut buf = vec![0u8; buf_size];
+    fill_random(&mut buf).map_err(|e| anyhow::anyhow!("Failed to generate buffer: {}", e))?;
+
+    measure_throughput(&mut buf, duration, |data, block_num| {
+        cipher
+            .encrypt_block_aes_gcm_siv_inplace(data, block_num, 0)
+            .map(|_tag| ())
+    })
+}
+
+/// Benchmarks a legacy CBC block cipher (AES-128/192/256 or Blowfish).
+fn bench_cbc(
+    iface_name: &str,
+    key_size: i32,
+    buf_size: usize,
+    duration: std::time::Duration,
+) -> Result<f64> {
+    use encfs::config::Interface;
+    use encfs::crypto::cipher;
+
+    let iface = Interface {
+        name: iface_name.to_string(),
+        major: 3,
+        minor: 0,
+        age: 0,
+    };
+    let mut cipher = cipher::build(&iface, key_size)?;
+    let mut key = vec![0u8; (key_size / 8) as usize];
+    fill_random(&mut key).map_err(|e| anyhow::anyhow!("Failed to generate key: {}", e))?;
+    let iv = vec![0u8; cipher.iv_len()];
+    cipher.set_key(&key, &iv);
+
+    let mut buf = vec![0u8; buf_size];
+    fill_random(&mut buf).map_err(|e| anyhow::anyhow!("Failed to generate buffer: {}", e))?;
+    let block_size = buf_size as u64;
+
+    measure_throughput(&mut buf, duration, |data, block_num| {
+        cipher.encrypt_block_inplace(data, block_num, 0, block_size)
+    })
+}
+
+fn cmd_speed() -> Result<()> {
+    use chrono::Local;
+    use std::time::Duration;
+
+    println!(
+        "encfsctl v{}; {} {}/{}",
+        env!("CARGO_PKG_VERSION"),
+        Local::now().format("%Y-%m-%d"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    println!(
+        "cpu: {}; {} AES hardware acceleration",
+        cpu_brand(),
+        if aes_hw_accel() { "with" } else { "without" }
+    );
+    println!();
+
+    const BENCH_DURATION: Duration = Duration::from_millis(500);
+    // 1 MiB: a multiple of every block size used below (8 bytes for
+    // Blowfish, 16 for AES), so CBC's NoPadding never rejects it.
+    const BUF_SIZE: usize = 1 << 20;
+
+    struct Row {
+        name: &'static str,
+        result: Result<f64>,
+        note: &'static str,
+    }
+
+    let rows = vec![
+        Row {
+            name: "AES-256-GCM-SIV",
+            result: bench_aes_gcm_siv(256, BUF_SIZE, BENCH_DURATION),
+            note: "  (default, V7 file content)",
+        },
+        Row {
+            name: "AES-128-GCM-SIV",
+            result: bench_aes_gcm_siv(128, BUF_SIZE, BENCH_DURATION),
+            note: "",
+        },
+        Row {
+            name: "AES-256-CBC (legacy)",
+            result: bench_cbc("ssl/aes", 256, BUF_SIZE, BENCH_DURATION),
+            note: "",
+        },
+        Row {
+            name: "AES-192-CBC (legacy)",
+            result: bench_cbc("ssl/aes", 192, BUF_SIZE, BENCH_DURATION),
+            note: "",
+        },
+        Row {
+            name: "AES-128-CBC (legacy)",
+            result: bench_cbc("ssl/aes", 128, BUF_SIZE, BENCH_DURATION),
+            note: "",
+        },
+        Row {
+            name: "Blowfish-CBC (legacy)",
+            result: bench_cbc("ssl/blowfish", 160, BUF_SIZE, BENCH_DURATION),
+            note: "  (deprecated)",
+        },
+    ];
+
+    for row in rows {
+        match row.result {
+            Ok(mbps) => println!("{:<24}{:>10.2} MB/s{}", row.name, mbps, row.note),
+            Err(_) => println!("{:<24}{:>10}{}", row.name, "N/A", row.note),
+        }
+    }
 
     Ok(())
 }

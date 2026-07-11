@@ -27,7 +27,7 @@ daemonize = "0.5"
 chrono = "0.4"
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.10"
-fuse_mt = "0.6.4"
+fuse_mt = "0.6.5-beta1"
 libc = "0.2.186"
 log = "0.4.32"
 quick-xml = { version = "0.40.1", features = ["serialize"] }
@@ -41,6 +41,7 @@ pbkdf2 = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
 zeroize = { version = "1", features = ["derive"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [[bin]]
 name = "encfsctl"
@@ -56,3 +57,6 @@ tar = "0.4"
 [package.metadata.i18n]
 default-locale = "en"
 available-locales = ["en", "fr", "de"]
+
+[patch.crates-io]
+fuse_mt = { git = "https://github.com/wfraser/fuse-mt", branch = "fuser-0.17" }
