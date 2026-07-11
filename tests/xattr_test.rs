@@ -38,6 +38,24 @@ fn req() -> RequestInfo {
     }
 }
 
+#[cfg(target_os = "macos")]
+unsafe fn listxattr_nofollow(
+    path: *const libc::c_char,
+    value: *mut libc::c_char,
+    size: usize,
+) -> libc::ssize_t {
+    unsafe { libc::listxattr(path, value, size, libc::XATTR_NOFOLLOW) }
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn listxattr_nofollow(
+    path: *const libc::c_char,
+    value: *mut libc::c_char,
+    size: usize,
+) -> libc::ssize_t {
+    unsafe { libc::llistxattr(path, value, size) }
+}
+
 #[test]
 fn test_xattr_set_get() {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -283,12 +301,12 @@ fn test_xattr_on_disk_storage() {
     let c_path = std::ffi::CString::new(encrypted_file_path.as_os_str().as_bytes()).unwrap();
 
     // Get size first
-    let size = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
+    let size = unsafe { listxattr_nofollow(c_path.as_ptr(), std::ptr::null_mut(), 0) };
 
     if size > 0 {
         let size_usize = size as usize;
         let mut buf = vec![0i8; size_usize];
-        let ret = unsafe { libc::llistxattr(c_path.as_ptr(), buf.as_mut_ptr(), size_usize) };
+        let ret = unsafe { listxattr_nofollow(c_path.as_ptr(), buf.as_mut_ptr(), size_usize) };
 
         if ret > 0 {
             buf.truncate(ret as usize);
@@ -298,6 +316,10 @@ fn test_xattr_on_disk_storage() {
 
             // Verify all xattrs on disk start with "user.encfs."
             for name in names {
+                // Ignore macOS system xattrs
+                if cfg!(target_os = "macos") && name.starts_with("com.apple.") {
+                    continue;
+                }
                 assert!(
                     name.starts_with("user.encfs."),
                     "xattr on disk should start with 'user.encfs.': {}",

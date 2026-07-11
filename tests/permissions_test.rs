@@ -308,6 +308,7 @@ fn test_symlink_permissions_are_standard() {
 
     // On most Unix systems, symlinks have 0o777 permissions
     // (the actual file permissions are determined by the target)
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(
         actual_mode, 0o777,
         "Symlinks should have 0o777 permissions, got {:o}",
@@ -393,6 +394,7 @@ fn test_permissions_mixed_types_in_directory() {
         .getattr(r, &PathBuf::from("/test_dir/test_link"), None)
         .expect("getattr for symlink failed");
     let link_actual = (link_attr.perm as u32) & 0o777;
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(
         link_actual, 0o777,
         "Symlink mode mismatch: expected {:o}, got {:o}",
